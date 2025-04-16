@@ -1,0 +1,2327 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Simple SLAM Demo with Three.js</title>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: Arial, sans-serif; }
+        canvas { display: block; }
+        #title {
+            position: absolute;
+            top: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0,0,0,0.7);
+            color: white;
+            padding: 10px 20px;
+            border-radius: 5px;
+            z-index: 100;
+            text-align: center;
+            font-size: 20px; /* Increase the base font size */
+        }
+        
+        #title h2 {
+            margin: 0; /* Remove default margins */
+            font-size: 3em; /* Make the h2 even larger relative to the container */
+        }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.7);
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            z-index: 100;
+        }
+        #controls {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.7);
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            z-index: 100;
+        }
+        button {
+            margin: 5px;
+            padding: 5px 10px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div id="title">
+        <h2>Ray Cheng SLAM Demo 2.0</h2>
+    </div>
+    <div id="info">
+        <div>Robot Position: <span id="position">X: 0.00, Z: 0.00</span></div>
+        <div>Map Coverage: <span id="coverage">0%</span></div>
+        <!-- <div>Landmarks Found: <span id="landmarks">0</span></div> -->
+    </div>
+    <div id="controls">
+        <button id="startStop">Start SLAM</button>
+        <button id="reset">Reset</button>
+        <div>View Mode:
+            <select id="viewMode">
+                <option value="3d">3D View</option>
+                <option value="topDown">Top-Down Map</option>
+                <option value="thirdPerson">Third Person View</option>
+                <option value="pointCloud">Point Cloud View</option>
+            </select>
+        </div>
+    </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        // Main variables
+        let scene, camera, camera2D, renderer;
+        let robot, robotPath, currentViewMode = "3d";
+        let grid = [];
+        let gridSize = 100; // Increased from 40 to 60 to match map size of 30x30
+        let cellSize = 0.5;
+        let obstacles = [];
+        let landmarks = [];
+        let isRunning = false;
+        let cameraFollowRobot = true;
+
+        // Define colors as constants for easy reference and consistency
+        const COLOR_OBSTACLE_MAP = 0xFF5733;      // Red-orange for obstacles
+        const COLOR_FREE_SPACE = 0x4CAF50;    // Green for free space
+        const COLOR_UNKNOWN = 0x555555;       // Dark gray for unknown areas
+        const COLOR_PATH = 0xFF0000; 
+        const COLOR_GRID_CENTER = 0x555555;
+        const COLOR_GRID_LINES = 0x333333;
+
+        const COLOR_ROBOT = 0x4285F4;         
+        const COLOR_WHEEL =  0x333333;        
+        const COLOR_SENSOR = 0xFF5733;
+
+
+
+        const COLOR_BACKGROUND = 0x333333;         // Gray for background
+        const COLOR_WALL = 0x666666;        
+        const COLOR_OBSTACLE_OBJECT = 0x666666;       
+        const COLOR_LANDMARK = 0xFFD700;      
+        const COLOR_GROUND = 0x222222;        // Dark gray for ground
+        const COLOR_LIGHT = 0xFFFFFF;
+
+        const MAX_PATH_POINTS = 20000;
+        const SENSE_RADIUS = 5;
+
+        const RAY_DIRECTIONS = 32; // Number of rays to cast
+
+        // Mouse controls
+        let isDragging = false;
+        let previousMousePosition = { x: 0, y: 0 };
+        let cameraDistance = 18;
+        let minCameraDistance = 5;   // Minimum zoom
+        let maxCameraDistance = 30;  // Maximum zoom
+        let cameraAngleHorizontal = Math.PI / 4;
+        let cameraAngleVertical = Math.PI / 6;
+
+        let thirdPersonDistance = 10; // Distance behind robot for third-person view
+        let minThirdPersonDistance = 2; // Distance behind robot for third-person view
+        let maxThirdPersonDistance = 10; // Distance behind robot for third-person view
+
+        let twoDCameraViewSize = 20; // Default view size for top-down view
+        let minTwoDCameraViewSize = 5; // Minimum zoom level for top-down view
+        let maxTwoDCameraViewSize = 30; // Maximum zoom level for top-down view
+
+        // Add variables for camera position control in top-down view
+        let camera2DPosition = { x: 0, z: 0 };
+        const camera2DMoveSpeed = 0.5;
+        const camera2DMoveLimit = 20; // Maximum distance from center
+        const keysPressed = {}; // Track pressed keys
+        
+        // Add these variables
+        let completionMessage = null;
+        let mappingComplete = false;
+
+        // Add path visualization and path following properties
+        let pathVisualization = null;
+
+        // Initialize grid for mapping
+        function initGrid() {
+            grid = [];
+            for (let i = 0; i < gridSize; i++) {
+                grid[i] = [];
+                for (let j = 0; j < gridSize; j++) {
+                    grid[i][j] = {
+                        visited: false,
+                        obstacle: false,
+                        x: (i - gridSize/2) * cellSize,
+                        z: (j - gridSize/2) * cellSize
+                    };
+                }
+            }
+        }
+        
+        // Map visualization with cell objects stored for reuse
+        let mapVisualization = null;
+        let mapCells = []; // Will hold references to all grid cell meshes
+        
+        // Initialize the map visualization once during setup
+        function initMapVisualization() {
+            // Create the group container
+            mapVisualization = new THREE.Group();
+            scene.add(mapVisualization);
+            
+            // Shared geometries and materials (reused for all cells)
+            const cellGeometry = new THREE.PlaneGeometry(cellSize * 0.9, cellSize * 0.9);
+            const freeMaterial = new THREE.MeshBasicMaterial({ color: COLOR_FREE_SPACE });
+            const obstacleMaterial = new THREE.MeshBasicMaterial({ color: COLOR_OBSTACLE_MAP });
+            const unknownMaterial = new THREE.MeshBasicMaterial({ 
+                color: COLOR_UNKNOWN, 
+                transparent: true, 
+                opacity: 0.0 
+            });
+            
+            // Create all grid cells once
+            for (let i = 0; i < gridSize; i++) {
+                mapCells[i] = [];
+                for (let j = 0; j < gridSize; j++) {
+                    const cell = grid[i][j];
+                    
+                    // Create a mesh for each cell (initially invisible)
+                    const plane = new THREE.Mesh(cellGeometry, unknownMaterial);
+                    plane.position.set(cell.x, 0.02, cell.z);
+                    plane.rotation.x = -Math.PI / 2;
+                    plane.visible = false; // Start invisible
+                    
+                    // Store reference to materials for quick updates
+                    plane.userData = {
+                        freeMaterial: freeMaterial,
+                        obstacleMaterial: obstacleMaterial,
+                        unknownMaterial: unknownMaterial,
+                        visited: false,
+                        obstacle: false
+                    };
+                    
+                    // Add to group and store reference
+                    mapVisualization.add(plane);
+                    mapCells[i][j] = plane;
+                }
+            }
+        }
+        
+        // Update only cells that have changed state
+        function updateMapVisualization() {
+            for (let i = 0; i < gridSize; i++) {
+                for (let j = 0; j < gridSize; j++) {
+                    const gridCell = grid[i][j];
+                    const cellMesh = mapCells[i][j];
+                    
+                    // Only update cells whose state has changed
+                    if (gridCell.visited !== cellMesh.userData.visited ||
+                        gridCell.obstacle !== cellMesh.userData.obstacle) {
+                        
+                        // Update the mesh to match current grid state
+                        if (gridCell.visited) {
+                            cellMesh.visible = true;
+                            cellMesh.material = gridCell.obstacle ? 
+                                cellMesh.userData.obstacleMaterial : 
+                                cellMesh.userData.freeMaterial;
+                        } else {
+                            cellMesh.visible = false;
+                        }
+                        
+                        // Store current state to detect future changes
+                        cellMesh.userData.visited = gridCell.visited;
+                        cellMesh.userData.obstacle = gridCell.obstacle;
+                    }
+                }
+            }
+        }
+        
+        // Initialize the scene
+        function init() {
+            // Create scene
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(COLOR_BACKGROUND);
+            
+            // Create 3D perspective camera
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000); // field of view, aspect ratio, near, far
+            camera.position.set(10, 10, 10);
+            camera.lookAt(0, 0, 0);
+            
+            // Create 2D orthographic camera for top-down view
+            const aspect = window.innerWidth / window.innerHeight;
+            
+            camera2D = new THREE.OrthographicCamera(
+                -twoDCameraViewSize * aspect, twoDCameraViewSize * aspect, 
+                twoDCameraViewSize, -twoDCameraViewSize, 0.1, 1000
+            );
+            camera2D.position.set(0, 20, 0);
+            camera2D.lookAt(0, 0, 0);
+            camera2D.up.set(0, 0, -1); // Correct orientation for top-down view
+            
+            // Create renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight); // width, height
+            document.body.appendChild(renderer.domElement); 
+
+            setupMouseControls();
+            setupKeyboardControls(); // Add keyboard controls setup
+            
+            // Add lights
+            const ambientLight = new THREE.AmbientLight(COLOR_LIGHT, 0.6); // color, intensity
+            scene.add(ambientLight);
+            
+            const directionalLight = new THREE.DirectionalLight(COLOR_LIGHT, 0.8);
+            directionalLight.position.set(10, 20, 10); // position x, y, z
+            scene.add(directionalLight);
+            
+            // Create ground
+            createGround();
+            
+            // Initialize grid
+            initGrid();
+            
+            // Initialize map visualization
+            initMapVisualization();
+            
+            // Create robot
+            createRobot();
+            
+            // Create path trail for robot
+            createRobotPath();
+            
+            // Create random obstacles and landmarks
+            createEnvironment();
+            
+            // Event listeners
+            window.addEventListener('resize', onWindowResize);
+            document.getElementById('startStop').addEventListener('click', toggleSimulation);
+            document.getElementById('reset').addEventListener('click', resetSimulation);
+            document.getElementById('viewMode').addEventListener('change', changeViewMode);
+            
+            // Start animation loop
+            animate();
+        }
+
+        // Mouse controls
+
+        function setupMouseControls() {
+            renderer.domElement.addEventListener('mousedown', onMouseDown);
+            renderer.domElement.addEventListener('mousemove', onMouseMove);
+            renderer.domElement.addEventListener('mouseup', onMouseUp);
+            renderer.domElement.addEventListener('mouseleave', onMouseUp);
+            // Add wheel event listener for zoom control
+            renderer.domElement.addEventListener('wheel', onMouseWheel, { passive: false });
+        }
+        
+        function onMouseDown(event) {
+            if (currentViewMode === "3d") {
+                isDragging = true;
+                previousMousePosition = {
+                    x: event.clientX,
+                    y: event.clientY
+                };
+            }
+        }
+        
+        function onMouseMove(event) {
+            if (isDragging && currentViewMode === "3d") {
+                const deltaMove = {
+                    x: event.clientX - previousMousePosition.x,
+                    y: event.clientY - previousMousePosition.y
+                };
+                
+                // Adjust camera angles based on mouse movement
+                cameraAngleHorizontal += deltaMove.x * 0.01;
+                cameraAngleVertical += deltaMove.y * 0.01;
+                
+                // Limit vertical angle to prevent camera flipping
+                cameraAngleVertical = Math.max(0.1, Math.min(Math.PI / 2 - 0.1, cameraAngleVertical));
+                
+                // Update camera position
+                update3DCameraPosition();
+                
+                previousMousePosition = {
+                    x: event.clientX,
+                    y: event.clientY
+                };
+            }
+        }
+        
+        function onMouseUp() {
+            isDragging = false;
+        }
+        
+        function onMouseWheel(event) {
+            if (currentViewMode === "3d") {
+                // Prevent page scrolling
+                event.preventDefault();
+                
+                // Get scroll direction (positive = zoom out, negative = zoom in)
+                const zoomAmount = event.deltaY * 0.005;
+                
+                // Update camera distance with constraints
+                cameraDistance += zoomAmount;
+                cameraDistance = Math.max(minCameraDistance, Math.min(maxCameraDistance, cameraDistance));
+                
+                // Update camera position to reflect new distance
+                update3DCameraPosition();
+            } 
+            else if (currentViewMode === "thirdPerson") {
+                // Prevent page scrolling
+                event.preventDefault();
+                
+                // Get scroll direction for third person view
+                const zoomAmount = event.deltaY * 0.002;
+                
+                // Update third person distance with constraints
+                thirdPersonDistance += zoomAmount;
+                thirdPersonDistance = Math.max(minThirdPersonDistance, Math.min(maxThirdPersonDistance, thirdPersonDistance));
+                
+                // No need to call update3DCameraPosition as animate loop will handle it
+            }
+            else if (currentViewMode === "topDown") {
+                // Prevent page scrolling
+                event.preventDefault();
+                
+                // Get scroll direction for top-down view (positive = zoom out, negative = zoom in)
+                const zoomAmount = event.deltaY * 0.02;
+                
+                // Update the view size with constraints
+                twoDCameraViewSize += zoomAmount;
+                twoDCameraViewSize = Math.max(minTwoDCameraViewSize, Math.min(maxTwoDCameraViewSize, twoDCameraViewSize));
+                
+                // Update the orthographic camera with new view size
+                updateTopDownCamera();
+            }
+        }
+        
+        // Add this function to update the top-down orthographic camera
+        function updateTopDownCamera() {
+            const aspect = window.innerWidth / window.innerHeight;
+            
+            // Update camera projection based on new view size
+            camera2D.left = -twoDCameraViewSize * aspect;
+            camera2D.right = twoDCameraViewSize * aspect;
+            camera2D.top = twoDCameraViewSize;
+            camera2D.bottom = -twoDCameraViewSize;
+            
+            // Required to update the camera after changing properties
+            camera2D.updateProjectionMatrix();
+            
+            // Maintain the camera's horizontal position
+            camera2D.position.x = camera2DPosition.x;
+            camera2D.position.z = camera2DPosition.z;
+            updateTopDownCameraControls(); // Add camera controls update
+        }
+        
+        function update3DCameraPosition() {
+            if (currentViewMode === "3d") {
+                // Calculate camera position in spherical coordinates
+                const x = cameraDistance * Math.sin(cameraAngleVertical) * Math.sin(cameraAngleHorizontal);
+                const y = cameraDistance * Math.cos(cameraAngleVertical);
+                const z = cameraDistance * Math.sin(cameraAngleVertical) * Math.cos(cameraAngleHorizontal);
+                
+                // Position camera relative to robot
+                camera.position.x = robot.position.x + x;
+                camera.position.y = robot.position.y + y;
+                camera.position.z = robot.position.z + z;
+                
+                // Keep camera focused on robot
+                camera.lookAt(robot.position);
+            }
+        }
+        
+        // Add this function to update third person camera position
+        function updateThirdPersonCamera() {
+            // Calculate position behind the robot based on its orientation
+            const robotDirection = new THREE.Vector3(
+                -Math.sin(robot.rotation.y), // Negative to go backward
+                0,
+                -Math.cos(robot.rotation.y)  // Negative to go backward
+            ).normalize();
+            
+            // Position camera behind robot
+            camera.position.copy(robot.position).add(
+                robotDirection.multiplyScalar(thirdPersonDistance) // Move back by distance
+            );
+            
+            // Add some height to look down at robot
+            camera.position.y = robot.position.y + thirdPersonDistance * 0.6;
+            
+            // Look at robot
+            camera.lookAt(
+                robot.position.x,
+                robot.position.y + 0.5, // Look slightly above robot
+                robot.position.z
+            );
+        }
+        
+        // Create ground plane
+        function createGround() {
+            const groundSize = gridSize * cellSize;
+            const groundGeometry = new THREE.PlaneGeometry(groundSize, groundSize);
+            const groundMaterial = new THREE.MeshStandardMaterial({ 
+                color: COLOR_GROUND,
+                side: THREE.DoubleSide
+            });
+            const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+            ground.rotation.x = -Math.PI / 2;
+            scene.add(ground);
+            
+            // Create grid lines
+            const gridHelper = new THREE.GridHelper(groundSize, gridSize, COLOR_GRID_CENTER, COLOR_GRID_LINES); // color of the grid lines
+            scene.add(gridHelper);
+        }
+        
+        // Create robot
+        function createRobot() {
+            // Robot body
+            const bodyGeometry = new THREE.BoxGeometry(0.4, 0.4, 1); // width, height, length
+            const bodyMaterial = new THREE.MeshStandardMaterial({ color: COLOR_ROBOT });
+            robot = new THREE.Group();
+            const body = new THREE.Mesh(bodyGeometry, bodyMaterial);
+            body.position.y = 0.2;
+            robot.add(body);
+            
+            // Robot sensor (cone for visualization)
+            const sensorGeometry = new THREE.ConeGeometry(0.25, 0.5, 8); // Smaller dimensions
+            const sensorMaterial = new THREE.MeshStandardMaterial({ 
+                color: COLOR_SENSOR,
+                transparent: true,
+                opacity: 0.7
+            });
+            const sensor = new THREE.Mesh(sensorGeometry, sensorMaterial);
+            sensor.position.set(0, 0.3, 0.5); // Adjusted position to sit on top of robot body
+            sensor.rotation.x = Math.PI / 2; // Keep same rotation
+            robot.add(sensor);
+            
+            // Add wheels
+            const wheelGeometry = new THREE.CylinderGeometry(0.2, 0.2, 0.1, 16); // radius of the top, radius of the bottom, height, segments
+            const wheelMaterial = new THREE.MeshStandardMaterial({ color: COLOR_WHEEL });
+            
+            const wheelFL = new THREE.Mesh(wheelGeometry, wheelMaterial);
+            wheelFL.position.set(0.25, 0.2, 0.3);
+            wheelFL.rotation.z = Math.PI / 2;
+            robot.add(wheelFL);
+            
+            const wheelFR = new THREE.Mesh(wheelGeometry, wheelMaterial);
+            wheelFR.position.set(-0.25, 0.2, 0.3);
+            wheelFR.rotation.z = Math.PI / 2;
+            robot.add(wheelFR);
+            
+            const wheelBL = new THREE.Mesh(wheelGeometry, wheelMaterial);
+            wheelBL.position.set(0.25, 0.2, -0.3);
+            wheelBL.rotation.z = Math.PI / 2;
+            robot.add(wheelBL);
+            
+            const wheelBR = new THREE.Mesh(wheelGeometry, wheelMaterial);
+            wheelBR.position.set(-0.25, 0.2, -0.3);
+            wheelBR.rotation.z = Math.PI / 2;
+            robot.add(wheelBR);
+            
+            // Robot properties
+            robot.position.y = 0.0;
+            robot.userData = {
+                speed: 0.05,
+                rotationSpeed: 0.02,
+                direction: 0,
+                targetDirection: 0,
+                senseRadius: SENSE_RADIUS,
+                moveMode: 'exploring', // 'exploring', 'rotating', 
+                visitedPositions: [],
+                targetDestination: null,
+                pathIndex: 0,
+                targetPath: null  // Add this for path following
+            };
+            
+            scene.add(robot);
+        }
+        
+        // Create robot path visualization - redesigned with dynamic resizing
+        function createRobotPath() {
+            const pathMaterial = new THREE.LineBasicMaterial({ color: COLOR_PATH });
+            
+            // Use an empty array instead of fixed-size Float32Array
+            const positions = [];
+            
+            // Create buffer geometry from empty array
+            const pathGeometry = new THREE.BufferGeometry();
+            
+            // We'll update the attributes as needed later
+            robotPath = new THREE.Line(pathGeometry, pathMaterial);
+            robotPath.frustumCulled = false;
+            robotPath.position.y = 0.05; // Slightly above ground
+            scene.add(robotPath);
+            
+            // Add a property to store positions for easy access
+            robotPath.userData = {
+                positions: positions,
+                maxPoints: MAX_PATH_POINTS, // Maximum points to keep in path
+                visitedPositions: new Set() // Track unique visited positions as grid coordinates
+            };
+        }
+        
+        // Update robot's path visualization and ensure visited positions aren't obstacles
+        function updateRobotPath() {
+            // Get the positions array from userData
+            const positions = robotPath.userData.positions;
+            
+            // Add new point (only if robot has moved enough to be visually different)
+            if (positions.length === 0 || 
+                new THREE.Vector3(positions[positions.length-3], positions[positions.length-2], positions[positions.length-1])
+                    .distanceTo(robot.position) > 0.05) {
+                
+                // Add new position
+                positions.push(robot.position.x, 0.05, robot.position.z);
+                
+                // If we exceed max points, remove oldest points
+                if (positions.length > robotPath.userData.maxPoints * 3) {
+                    // Remove first 3 elements (x,y,z of oldest point)
+                    positions.splice(0, 3);
+                }
+                
+                // Update the geometry with new positions
+                robotPath.geometry.setAttribute(
+                    'position', 
+                    new THREE.Float32BufferAttribute(positions, 3)
+                );
+                
+                // Mark for update
+                robotPath.geometry.attributes.position.needsUpdate = true;
+                
+                // Convert robot position to grid coordinates
+                const gridX = Math.floor((robot.position.x + gridSize * cellSize / 2) / cellSize);
+                const gridY = Math.floor((robot.position.z + gridSize * cellSize / 2) / cellSize);
+                
+                // Create a key for this grid position
+                const posKey = `${gridX},${gridY}`;
+                
+                // If we haven't processed this position before
+                if (!robotPath.userData.visitedPositions.has(posKey)) {
+                    robotPath.userData.visitedPositions.add(posKey);
+                    
+                    // Ensure this cell is marked as visited and NOT an obstacle
+                    if (gridX >= 0 && gridX < gridSize && gridY >= 0 && gridY < gridSize) {
+                        grid[gridX][gridY].visited = true;
+                        grid[gridX][gridY].obstacle = false; // Explicitly set to false
+                        
+                        // Update visual representation if it exists
+                        if (mapCells && mapCells[gridX] && mapCells[gridX][gridY]) {
+                            mapCells[gridX][gridY].userData.visited = true;
+                            mapCells[gridX][gridY].userData.obstacle = false;
+                            mapCells[gridX][gridY].visible = true;
+                            mapCells[gridX][gridY].material = mapCells[gridX][gridY].userData.freeMaterial;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Create random obstacles and landmarks
+        function createEnvironment() {
+            // Clear existing obstacles and landmarks
+            obstacles.forEach(obj => scene.remove(obj));
+            landmarks.forEach(obj => scene.remove(obj));
+            obstacles = [];
+            landmarks = [];
+            
+            // Create outer boundaries
+            createWall(-20, -20, 20, -20); // South wall
+            createWall(-20, 20, 20, 20);   // North wall
+            createWall(-20, -20, -20, 20); // West wall
+            createWall(20, -20, 20, 20);   // East wall
+            
+            // Create zigzag corridors - all accessible
+            
+            // Zigzag in southwest quadrant
+            createWall(-13, -13, -8, -13);
+            createWall(-8, -13, -8, -8);
+            createWall(-8, -8, -13, -8);
+            createWall(-13, -8, -13, -3);
+            createWall(-13, -3, -8, -3);
+            // Leave opening so robot can enter
+            
+            // Zigzag in southeast quadrant
+            createWall(8, -13, 13, -13);
+            createWall(13, -13, 13, -8);
+            createWall(13, -8, 8, -8);
+            createWall(8, -8, 8, -3);
+            createWall(8, -3, 13, -3);
+            createWall(13, -3, 13, -8);
+            // Leave opening so robot can enter
+            
+
+            
+            // Zigzag in northeast quadrant
+            createWall(8, 3, 8, 13);
+            createWall(8, 13, 11, 13);
+            createWall(11, 13, 11, 8);
+            createWall(11, 8, 14, 8);
+            createWall(14, 8, 14, 3);
+            // Leave opening so robot can enter
+            
+            // Zigzag in northwest quadrant
+            createWall(-8, 3, -8, 13);
+            createWall(-8, 13, -11, 13);
+            createWall(-11, 13, -11, 8);
+            createWall(-11, 8, -14, 8);
+            createWall(-14, 8, -14, 3);
+            // Leave opening so robot can enter
+            
+            // Additional corridor sections
+            createWall(-3, -10, 3, -10);
+            createWall(0, -10, 0, -6);
+            
+            createWall(-3, 10, 3, 10);
+            createWall(0, 10, 0, 6);
+            
+            // Create some random obstacles in open areas
+            for (let i = 0; i < 10; i++) {
+                createObstacle();
+            }
+            
+            // Create landmarks throughout the map
+            // for (let i = 0; i < 25; i++) {
+            //     createLandmark();
+            // }
+            
+            // Mark obstacles in grid
+            markObstaclesInGrid();
+        }
+        
+        // Create a wall segment
+        function createWall(x1, z1, x2, z2) {
+            const length = Math.sqrt(Math.pow(x2 - x1, 2) + Math.pow(z2 - z1, 2));
+            const wallGeometry = new THREE.BoxGeometry(length, 1, 0.3);
+            const wallMaterial = new THREE.MeshStandardMaterial({ color: COLOR_WALL });
+            const wall = new THREE.Mesh(wallGeometry, wallMaterial);
+            
+            wall.position.set((x1 + x2) / 2, 0.5, (z1 + z2) / 2);
+            wall.position.y = 0.5;
+            
+            // Rotate wall to align with direction
+            const angle = Math.atan2(z2 - z1, x2 - x1);
+            wall.rotation.y = angle;
+            
+            scene.add(wall);
+            obstacles.push(wall);
+        }
+        
+        // Create a random obstacle
+        function createObstacle() {
+            const size = Math.random() * 0.5 + 0.5;
+            const height = Math.random() * 1 + 0.5;
+            const geometry = new THREE.BoxGeometry(size, height, size);
+            const material = new THREE.MeshStandardMaterial({ color: COLOR_OBSTACLE_OBJECT });
+            const obstacle = new THREE.Mesh(geometry, material);
+            
+            // Random position
+            let x, z;
+            let validPosition = false;
+            
+            while (!validPosition) {
+                x = Math.random() * 18 - 9;
+                z = Math.random() * 18 - 9;
+                
+                // Check distance from robot starting position
+                const distFromOrigin = Math.sqrt(x*x + z*z);
+                if (distFromOrigin > 2) {
+                    validPosition = true;
+                }
+            }
+            
+            obstacle.position.set(x, height/2, z);
+            scene.add(obstacle);
+            obstacles.push(obstacle);
+        }
+        
+        // Create a landmark (will be discovered by robot)
+        function createLandmark() {
+            const geometries = [
+                new THREE.SphereGeometry(0.2),
+                new THREE.TetrahedronGeometry(0.3),
+                new THREE.OctahedronGeometry(0.3)
+            ];
+            
+            const geometry = geometries[Math.floor(Math.random() * geometries.length)];
+            const material = new THREE.MeshStandardMaterial({ 
+                color: COLOR_LANDMARK,
+                transparent: true,
+                opacity: 0.6 // Initially semi-transparent until discovered
+            });
+            
+            const landmark = new THREE.Mesh(geometry, material);
+            
+            // Random position
+            let x, z;
+            let validPosition = false;
+            
+            while (!validPosition) {
+                x = Math.random() * 18 - 9;
+                z = Math.random() * 18 - 9;
+                
+                // Check distance from obstacles and other landmarks
+                validPosition = true;
+                obstacles.forEach(obs => {
+                    const dist = Math.sqrt(
+                        Math.pow(x - obs.position.x, 2) + 
+                        Math.pow(z - obs.position.z, 2)
+                    );
+                    if (dist < 1) validPosition = false;
+                });
+                
+                landmarks.forEach(lm => {
+                    const dist = Math.sqrt(
+                        Math.pow(x - lm.position.x, 2) + 
+                        Math.pow(z - lm.position.z, 2)
+                    );
+                    if (dist < 2) validPosition = false;
+                });
+            }
+            
+            landmark.position.set(x, 0.3, z);
+            landmark.userData = {
+                discovered: false,
+                id: landmarks.length
+            };
+            
+            scene.add(landmark);
+            landmarks.push(landmark);
+        }
+        
+        // Mark obstacle positions in grid
+        function markObstaclesInGrid() {
+            // Reset grid obstacles
+            for (let i = 0; i < gridSize; i++) {
+                for (let j = 0; j < gridSize; j++) {
+                    grid[i][j].obstacle = false;
+                }
+            }
+            
+            // Mark obstacles in grid
+            obstacles.forEach(obstacle => {
+                // Get bounding box
+                const box = new THREE.Box3().setFromObject(obstacle);
+                
+                // Mark grid cells within the bounding box
+                for (let i = 0; i < gridSize; i++) {
+                    for (let j = 0; j < gridSize; j++) {
+                        const cellX = grid[i][j].x;
+                        const cellZ = grid[i][j].z;
+                        
+                        if (cellX >= box.min.x - cellSize/2 && cellX <= box.max.x + cellSize/2 &&
+                            cellZ >= box.min.z - cellSize/2 && cellZ <= box.max.z + cellSize/2) {
+                            grid[i][j].obstacle = true;
+                        }
+                    }
+                }
+            });
+        }
+        
+
+        
+        // Count discovered landmarks
+        function countDiscoveredLandmarks() {
+            return landmarks.filter(l => l.userData.discovered).length;
+        }
+        
+        // Handle window resize
+        function onWindowResize() {
+            const width = window.innerWidth;
+            const height = window.innerHeight;
+            
+            camera.aspect = width / height;
+            camera.updateProjectionMatrix();
+            
+            // Update orthographic camera aspect
+            updateTopDownCamera();
+            
+            renderer.setSize(width, height);
+        }
+        
+        // Toggle simulation
+        function toggleSimulation() {
+            isRunning = !isRunning;
+            const button = document.getElementById('startStop');
+            button.textContent = isRunning ? "Pause SLAM" : "Start SLAM";
+        }
+        
+        // Reset simulation
+        function resetSimulation() {
+            // Reset completion state
+            mappingComplete = false;
+            
+            // If there's a completion message, remove it
+            if (completionMessage) {
+                scene.remove(completionMessage);
+                completionMessage = null;
+            }
+            
+            // Remove any HTML overlay
+            const overlays = document.querySelectorAll('div[style*="position:fixed"]');
+            overlays.forEach(overlay => overlay.remove());
+            
+            // Reset robot
+            robot.position.set(0, 0.2, 0);
+            robot.rotation.y = 0;
+            robot.userData.direction = 0;
+            robot.userData.targetDirection = 0;
+            robot.userData.moveMode = 'exploring';
+            robot.userData.visitedPositions = [];
+            robot.userData.pathIndex = 0;
+            
+            // Reset grid
+            initGrid();
+            
+            // Reset path visualization
+            const positions = robotPath.userData.positions;
+            positions.length = 0;
+            
+            // Reset environment
+            createEnvironment();
+            
+            // Reset map visualization
+            updateMapVisualization();
+            
+            // Reset path visualization
+            if (pathVisualization) {
+                scene.remove(pathVisualization);
+                pathVisualization = null;
+            }
+            
+            // Update info
+            updateInfo();
+            
+            // Stop simulation
+            isRunning = false;
+            document.getElementById('startStop').textContent = "Start SLAM";
+        }
+        
+        // Change view mode
+        function changeViewMode() {
+            currentViewMode = document.getElementById('viewMode').value;
+        }
+        
+        // Mark current cell as visited
+        function markCurrentCellVisited() {
+            const x = robot.position.x;
+            const z = robot.position.z;
+            
+            // Convert world coordinates to grid indices
+            const i = Math.floor((x + gridSize * cellSize / 2) / cellSize);
+            const j = Math.floor((z + gridSize * cellSize / 2) / cellSize);
+            
+            // Check if in bounds
+            if (i >= 0 && i < gridSize && j >= 0 && j < gridSize) {
+                grid[i][j].visited = true;
+                
+                // Add to robot's visited positions for backtracking
+                const newPos = new THREE.Vector3(x, 0, z);
+                
+                // Only add if it's not too close to the last position
+                if (robot.userData.visitedPositions.length === 0 || 
+                    newPos.distanceTo(robot.userData.visitedPositions[robot.userData.visitedPositions.length - 1]) > cellSize) {
+                    robot.userData.visitedPositions.push(newPos);
+                }
+            }
+        }
+        
+        // Sense obstacles and update grid
+        function senseEnvironment() {
+            const senseRadius = robot.userData.senseRadius;
+            const robotPos = new THREE.Vector3(
+                robot.position.x,
+                robot.position.y,
+                robot.position.z
+            );
+            
+            // Raycasting in multiple directions to simulate sensor readings
+            
+            for (let i = 0; i < RAY_DIRECTIONS; i++) {
+                const angle = (i / RAY_DIRECTIONS) * Math.PI * 2 + robot.rotation.y;
+                const direction = new THREE.Vector3(
+                    Math.sin(angle),
+                    0,
+                    Math.cos(angle)
+                );
+                
+                // Create a ray
+                const raycaster = new THREE.Raycaster(robotPos, direction, 0, senseRadius);
+                const intersects = raycaster.intersectObjects(obstacles);
+                
+                if (intersects.length > 0) {
+                    // Mark cells between robot and obstacle as free
+                    const hitDistance = intersects[0].distance;
+                    markCellsAlongRay(robotPos, direction, hitDistance, true);
+                } else {
+                    // Mark cells along ray as free
+                    markCellsAlongRay(robotPos, direction, senseRadius, false);
+                }
+            }
+            
+            // Check for landmarks in range
+            landmarks.forEach(landmark => {
+                if (!landmark.userData.discovered) {
+                    const distToLandmark = robotPos.distanceTo(landmark.position);
+                    if (distToLandmark < senseRadius) {
+                        // Discover landmark
+                        landmark.userData.discovered = true;
+                        landmark.material.opacity = 1.0; // Make fully visible
+                    }
+                }
+            });
+            
+            // Update map visualization
+            updateMapVisualization();
+        }
+        
+        // Mark cells along ray as free or obstacle
+        function markCellsAlongRay(origin, direction, distance, hitObstacle) {
+            // Use a higher resolution for ray steps (e.g., half or quarter of cell size)
+            const stepSize = cellSize / 4; // Much higher precision
+            const steps = Math.ceil(distance / stepSize);
+            
+            // Track the last visited cell to avoid redundant marking
+            let lastI = -1;
+            let lastJ = -1;
+            
+            for (let step = 0; step < steps; step++) {
+                const t = (step * stepSize) / distance;
+                const x = origin.x + direction.x * distance * t;
+                const z = origin.z + direction.z * distance * t;
+                
+                // Convert world coordinates to grid indices
+                const i = Math.floor((x + gridSize * cellSize / 2) / cellSize);
+                const j = Math.floor((z + gridSize * cellSize / 2) / cellSize);
+                
+                // Only process if this is a new cell (avoid redundant work)
+                if (i !== lastI || j !== lastJ) {
+                    // Check if in bounds
+                    if (i >= 0 && i < gridSize && j >= 0 && j < gridSize) {
+                        // Mark as visited
+                        grid[i][j].visited = true;
+                        
+                        // If we hit an obstacle and we're at the final segment of the ray
+                        // Use a range to improve accuracy of obstacle marking
+                        if (hitObstacle && step >= steps - Math.ceil(cellSize / stepSize)) {
+                            grid[i][j].obstacle = true;
+                            break; // Stop marking cells once we hit an obstacle
+                        }
+                    }
+                    
+                    // Update last visited cell
+                    lastI = i;
+                    lastJ = j;
+                }
+            }
+        }
+        
+        
+        // Update robot movement
+        function updateRobot() {
+            if (!isRunning) return;
+            
+            // Mark current cell as visited
+            markCurrentCellVisited();
+            
+            // Sense environment
+            senseEnvironment();
+            
+            // Update path visualization
+            updateRobotPath();
+            
+            // Check for mapping completion
+            checkMappingCompletion();
+            
+            // Robot behavior based on mode
+            switch (robot.userData.moveMode) {
+                case 'exploring':
+                    moveRobotExploring();
+                    break;
+                case 'rotating':
+                    rotateRobot();
+                    break;
+                case 'targetNav':
+                    navigateToTarget();
+                    break;
+            }
+            
+            // Update info display
+            updateInfo();
+        }
+
+        function moveRobotExploring() {
+            // Check if we need to find a new target based on actual conditions rather than a timer
+            // console.log("Exploring mode started");
+            const needNewTarget = (
+                // No current target path
+                !robot.userData.targetPath || 
+                
+                // Path is empty
+                robot.userData.targetPath.length === 0 ||
+                
+                // We've reached the end of our current path
+                (robot.userData.pathIndex >= robot.userData.targetPath.length) ||
+                
+                // The current path target is no longer valid
+                (robot.userData.targetPath && robot.userData.targetPath.length > 0 && 
+                 robot.userData.pathIndex < robot.userData.targetPath.length &&
+                 isTargetInvalid(robot.userData.targetPath[robot.userData.pathIndex]))
+            );
+            
+            if (needNewTarget) {
+                // console.log("Need a new exploration target");
+                
+                // Calculate current coverage
+                // const coverage = calculateCoverage();
+                
+                // Find best frontier with a path
+                // console.log("Calculating best frontier");
+                const bestFrontier = chooseBestFrontier();
+                if (bestFrontier) {
+                    // console.log("Found strategic target at ", bestFrontier.x, bestFrontier.z);
+                    
+                    // Set target destination and path
+                    robot.userData.targetDestination = new THREE.Vector3(
+                        bestFrontier.x,
+                        robot.position.y,
+                        bestFrontier.z
+                    );
+                    robot.userData.targetPath = bestFrontier.path;
+                    
+                    // Check if the first path point is too close to the robot
+                    const firstPathPoint = bestFrontier.path[0];
+                    const distanceToFirstPoint = Math.sqrt(
+                        Math.pow(robot.position.x - firstPathPoint.x, 2) +
+                        Math.pow(robot.position.z - firstPathPoint.z, 2)
+                    );
+                    
+                    // If the first point is close, start from the second point if available
+                    const minDistanceThreshold = cellSize * 1.5;
+                    
+                    if (distanceToFirstPoint < minDistanceThreshold && bestFrontier.path.length > 1) {
+                        // console.log("First path point is close, starting from current position instead");
+                        robot.userData.pathIndex = 1; // Skip to second point
+                    } else {
+                        robot.userData.pathIndex = 0; // Start at first point
+                    }
+                    
+                    // Visualize the path
+                    visualizePath(bestFrontier.path);
+                    
+                    // Switch to target navigation mode
+                    robot.userData.moveMode = 'targetNav';
+                    
+                    // Immediately execute target navigation for smoother transition
+                    navigateToTarget();
+                    return;
+                } else {
+                    // console.log("No valid frontiers found");
+                    // If no frontiers found, continue with random exploration
+                }
+            }
+            
+            // Default exploration behavior when we don't have a target
+            // ... rest of existing exploration code ...
+        }
+        
+        // Function to check if a target point is now invalid (became an obstacle or is unreachable)
+        function isTargetInvalid(targetPoint) {
+            // Check if the grid cell is now an obstacle
+            const i = Math.floor((targetPoint.x + gridSize * cellSize / 2) / cellSize);
+            const j = Math.floor((targetPoint.z + gridSize * cellSize / 2) / cellSize);
+            
+            // If the target is out of bounds or is now an obstacle
+            if (i < 0 || i >= gridSize || j < 0 || j >= gridSize || 
+                (grid[i][j].visited && grid[i][j].obstacle)) {
+                return true;
+            }
+            
+            // Additional check: see if the point is reachable from current position
+            const path = findPath(
+                robot.position.x,
+                robot.position.z,
+                targetPoint.x,
+                targetPoint.z
+            );
+            
+            // If no path exists to this point anymore
+            if (!path || path.length === 0) {
+                // console.log("Current target is no longer reachable");
+                return true;
+            }
+            
+            return false;
+        }
+
+
+
+        // Find frontier cells (visited cells next to unvisited, non-obstacle cells)
+        function findFrontierCells() {
+            const frontierCells = [];
+            for (let i = 0; i < gridSize; i++) {
+                for (let j = 0; j < gridSize; j++) {
+                    // Check if this cell is visited and not an obstacle
+                    if (grid[i][j].visited && !grid[i][j].obstacle) {
+                        // Check neighboring cells
+                        let hasUnexploredNeighbor = false;
+                        
+                        // Check 4 adjacent neighbors
+                        const neighbors = [
+                            {i: i-1, j: j},
+                            {i: i+1, j: j},
+                            {i: i, j: j-1},
+                            {i: i, j: j+1}
+                        ];
+                        
+                        for (const neighbor of neighbors) {
+                            // Check if neighbor is within grid boundaries
+                            if (neighbor.i >= 0 && neighbor.i < gridSize && 
+                                neighbor.j >= 0 && neighbor.j < gridSize) {
+                                
+                                // Check if neighbor is unexplored and not an obstacle
+                                if (!grid[neighbor.i][neighbor.j].visited && 
+                                    !grid[neighbor.i][neighbor.j].obstacle) {
+                                    hasUnexploredNeighbor = true;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        // If this cell has unexplored neighbors, it's a frontier
+                        if (hasUnexploredNeighbor) {
+                            frontierCells.push({
+                                x: grid[i][j].x,
+                                z: grid[i][j].z,
+                                i: i,
+                                j: j,
+                                // Calculate distance from robot (for prioritizing)
+                                distanceFromRobot: Math.sqrt(
+                                    Math.pow(grid[i][j].x - robot.position.x, 2) +
+                                    Math.pow(grid[i][j].z - robot.position.z, 2)
+                                )
+                            });
+                        }
+                    }
+                }
+            }
+            
+            return frontierCells;
+        }
+
+        function markUnreachableCellsAsObstacles() {
+            // Only run when no frontiers are left
+            const frontiers = findFrontierCells();
+            if (frontiers.length > 0) return; 
+            
+            console.log("Marking unreachable cells as obstacles...");
+            
+            // Step 1: Create a map of reachable cells using flood fill from robot's position
+            const reachableCells = new Set();
+            const queue = [];
+            const visited = new Set();
+            
+            // Find the grid cell closest to the robot
+            let closestI = 0, closestJ = 0, minDistance = Infinity;
+            for (let i = 0; i < gridSize; i++) {
+                for (let j = 0; j < gridSize; j++) {
+                    if (grid[i][j].visited) {
+                        const distance = 
+                            Math.sqrt(
+                                Math.pow(grid[i][j].x - robot.position.x, 2) + 
+                                Math.pow(grid[i][j].z - robot.position.z, 2)
+                            );
+                        if (distance < minDistance) {
+                            minDistance = distance;
+                            closestI = i;
+                            closestJ = j;
+                        }
+                    }
+                }
+            }
+            
+            // Start from robot's closest grid cell
+            queue.push(`${closestI},${closestJ}`);
+            visited.add(`${closestI},${closestJ}`);
+            
+            // Perform flood fill to find all reachable cells
+            while (queue.length > 0) {
+                const cellKey = queue.shift();
+                const [i, j] = cellKey.split(',').map(Number);
+                reachableCells.add(cellKey);
+                
+                // Check all four adjacent cells
+                const directions = [
+                    {di: 1, dj: 0},
+                    {di: -1, dj: 0},
+                    {di: 0, dj: 1},
+                    {di: 0, dj: -1}
+                ];
+                
+                for (const dir of directions) {
+                    const ni = i + dir.di;
+                    const nj = j + dir.dj;
+                    const neighborKey = `${ni},${nj}`;
+                    
+                    // Skip if outside grid bounds
+                    if (ni < 0 || nj < 0 || ni >= gridSize || nj >= gridSize) continue;
+                    
+                    // Skip if already visited or is an obstacle
+                    if (visited.has(neighborKey) || grid[ni][nj].obstacle) continue;
+                    
+                    // This cell is reachable
+                    queue.push(neighborKey);
+                    visited.add(neighborKey);
+                }
+            }
+            
+            // Step 2: Mark all unvisited cells that aren't reachable as obstacles
+            for (let i = 0; i < gridSize; i++) {
+                for (let j = 0; j < gridSize; j++) {
+                    const cellKey = `${i},${j}`;
+                    // If the cell is unvisited (unknown) and not in our reachable set
+                    if (!grid[i][j].visited && !grid[i][j].obstacle && !reachableCells.has(cellKey)) {
+                        // Mark as obstacle since it's unreachable
+                        grid[i][j].visited = true;
+                        grid[i][j].obstacle = true;
+                        
+                    }
+                }
+            }
+            
+            // Refresh the visualization
+            updateMapVisualization();
+        }
+
+
+        // Modify chooseBestFrontier to also calculate a path
+        function chooseBestFrontier() {
+            const frontiers = findFrontierCells();
+            
+            if (frontiers.length === 0) {
+                console.log("No more frontiers to explore!");
+                markUnreachableCellsAsObstacles();
+                isRunning = false;
+                return null;
+            }
+            
+            // Sort frontiers by distance initially
+            frontiers.sort((a, b) => a.distanceFromRobot - b.distanceFromRobot);
+            
+            // Get top candidates (we'll evaluate these more thoroughly)
+            const candidates = frontiers.slice(0, Math.min(15, frontiers.length));
+            
+            // Score each candidate
+            for (const candidate of candidates) {
+                // Try to find a path to this frontier
+                const path = findPath(
+                    robot.position.x, 
+                    robot.position.z,
+                    candidate.x,
+                    candidate.z
+                );
+                
+                if (path) {
+                    // Calculate how straight the path is by counting direction changes
+
+                    let totalAngleChange = 0;
+                    let pathLength = 0;
+                    for (let i = 1; i < path.length; i++) {
+                        const segmentLength = Math.sqrt(
+                            Math.pow(path[i].x - path[i-1].x, 2) + 
+                            Math.pow(path[i].z - path[i-1].z, 2)
+                        );
+                        pathLength += segmentLength;
+                    }
+
+                    
+                    // First calculate angle between robot direction and first path segment
+                    if (path.length > 1) {
+                        // Calculate first segment direction
+                        const firstDx = path[1].x - path[0].x;
+                        const firstDz = path[1].z - path[0].z;
+                        const firstSegmentAngle = Math.atan2(firstDx, firstDz);
+                        
+                        // Get robot's current heading
+                        const robotAngle = robot.userData.direction;
+                        
+                        // Calculate absolute angle difference between robot direction and first segment
+                        let initialAngleDiff = Math.abs(firstSegmentAngle - robotAngle);
+                        // Normalize to 0-π
+                        if (initialAngleDiff > Math.PI) initialAngleDiff = 2 * Math.PI - initialAngleDiff;
+                        
+                        // Add this initial angle difference to total
+                        totalAngleChange += initialAngleDiff;
+                    }
+                    
+                    // Now process all path segments
+                    for (let i = 1; i < path.length; i++) {
+                        // Calculate direction vector between points
+                        const dx = path[i].x - path[i-1].x;
+                        const dz = path[i].z - path[i-1].z;
+                        
+                        // Calculate angle of this segment
+                        const currentAngle = Math.atan2(dx, dz);
+                        
+
+                        // Count direction changes and calculate angle change
+                        // If not first segment, calculate angle change from previous segment
+                        if (i > 1) {
+                            const prevDx = path[i-1].x - path[i-2].x;
+                            const prevDz = path[i-1].z - path[i-2].z;
+                            const prevAngle = Math.atan2(prevDx, prevDz);
+                            
+                            // Calculate absolute angle difference
+                            let angleDiff = Math.abs(currentAngle - prevAngle);
+                            // Normalize to 0-π
+                            if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
+                            
+                            totalAngleChange += angleDiff;
+                        }
+                        
+
+                    }
+                    
+                    // Calculate distance to nearest obstacle
+                    let minObstacleDistance = Infinity;
+                    
+                    // Check distance to known obstacles in grid
+                    const candidateI = Math.floor((candidate.x + gridSize * cellSize / 2) / cellSize);
+                    const candidateJ = Math.floor((candidate.z + gridSize * cellSize / 2) / cellSize);
+                    
+                    // Check nearby cells in a 5x5 area
+                    for (let di = -3; di <= 3; di++) {
+                        for (let dj = -3; dj <= 3; dj++) {
+                            const i = candidateI + di;
+                            const j = candidateJ + dj;
+                            
+                            // Skip if out of bounds
+                            if (i < 0 || i >= gridSize || j < 0 || j >= gridSize) continue;
+                            
+                            // If obstacle, calculate distance
+                            if (grid[i][j].visited && grid[i][j].obstacle) {
+                                const obstacleX = grid[i][j].x;
+                                const obstacleZ = grid[i][j].z;
+                                const distance = Math.sqrt(
+                                    Math.pow(candidate.x - obstacleX, 2) +
+                                    Math.pow(candidate.z - obstacleZ, 2)
+                                );
+                                minObstacleDistance = Math.min(minObstacleDistance, distance);
+                            }
+                        }
+                    }
+                    
+                    // Calculate straight-line distance to target
+                    const directDistance = Math.sqrt(
+                        Math.pow(candidate.x - robot.position.x, 2) +
+                        Math.pow(candidate.z - robot.position.z, 2)
+                    );
+                    
+                    // Calculate path efficiency (ratio of direct distance to path length)
+                    // A perfectly straight path would have efficiency of 1.0
+
+                    // Calculate final score (lower is better)
+                    // Adjusted weight factors to prioritize straightness
+                    const distanceWeight = 1;     // Less important
+                    const angleChangeWeight = 3;  // Penalize total angle change. If angleChangeWeight==1, change 2pi loss is 2pi
+                    const obstacleWeight = 3;     // Keep high for safety
+                    
+                    // Default obstacle distance if none found
+                    if (minObstacleDistance === Infinity) {
+                        minObstacleDistance = 5; // Use a reasonable default
+                    }
+                    
+                    // Calculate safety factor (higher for points far from obstacles)
+                    const dangerScore = 3 / minObstacleDistance; // from 1 to MAX, max is worst case
+                    
+                    // Path straightness factor (normalize by path length)
+
+                    const distance_loss = distanceWeight * pathLength;
+                    const angle_loss = angleChangeWeight * totalAngleChange;
+                    const obstacle_loss = obstacleWeight * dangerScore;
+
+
+                    console.log("distance_loss: ", distance_loss);
+                    console.log("angle_loss: ", angle_loss);
+                    console.log("obstacle_loss: ", obstacle_loss);
+                    
+                    // Final score combines all factors
+                    candidate.score = distance_loss + angle_loss  + obstacle_loss;
+                    
+                    candidate.path = path;
+                    
+                }
+            }
+            
+            // Filter out candidates with no path
+            const validCandidates = candidates.filter(c => c.path);
+            
+            if (validCandidates.length === 0) {
+                console.log("No valid paths to any frontiers!");
+                return null;
+            }
+            
+            // Sort by score (lower is better)
+            validCandidates.sort((a, b) => a.score - b.score);
+            
+            // Log the chosen frontier details
+            const chosen = validCandidates[0];
+            // console.log(`Chosen frontier at (${chosen.x.toFixed(1)}, ${chosen.z.toFixed(1)}) with score ${chosen.score.toFixed(2)}`);
+            
+            return chosen;
+        }
+        
+
+        function rotateRobot() {
+            // Calculate angle difference
+            let angleDiff = robot.userData.targetDirection - robot.userData.direction;
+            
+            // Normalize to -PI to PI
+            while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+            while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+            
+            // Rotate towards target
+            if (Math.abs(angleDiff) < robot.userData.rotationSpeed) {
+                // Close enough, snap to target
+                robot.userData.direction = robot.userData.targetDirection;
+                robot.rotation.y = robot.userData.direction;
+                robot.userData.moveMode = 'targetNav'; // Change back to targetNav instead of exploring
+                navigateToTarget();
+            } else {
+                // Rotate towards target
+                const rotationAmount = Math.sign(angleDiff) * robot.userData.rotationSpeed;
+                robot.userData.direction += rotationAmount;
+                robot.rotation.y = robot.userData.direction;
+            }
+        }
+
+        // Calculate grid coverage percentage Can be faster
+        function calculateCoverage() {
+            let visitedCount = 0;
+            let totalCells = 0;
+            
+            for (let i = 0; i < gridSize; i++) {
+                for (let j = 0; j < gridSize; j++) {
+                    if (!grid[i][j].obstacle) {
+                        totalCells++;
+                        if (grid[i][j].visited) visitedCount++;
+                    }
+                }
+            }
+            
+            return (visitedCount / totalCells) * 100;
+        }
+        
+
+        
+        // Find the optimal path using A* algorithm with diagonal movement
+        function findPath(startX, startZ, targetX, targetZ) {
+            // Convert world coordinates to grid indices
+            const startI = Math.floor((startX + gridSize * cellSize / 2) / cellSize);
+            const startJ = Math.floor((startZ + gridSize * cellSize / 2) / cellSize);
+            const targetI = Math.floor((targetX + gridSize * cellSize / 2) / cellSize);
+            const targetJ = Math.floor((targetZ + gridSize * cellSize / 2) / cellSize);
+            
+            // Check bounds
+            if (startI < 0 || startI >= gridSize || startJ < 0 || startJ >= gridSize ||
+                targetI < 0 || targetI >= gridSize || targetJ < 0 || targetJ >= gridSize) {
+                console.log("Path endpoints out of bounds");
+                return null;
+            }
+            
+            // A* pathfinding
+            const openSet = [];
+            const closedSet = new Set();
+            const cameFrom = {};
+            const gScore = {};
+            const fScore = {};
+            
+            // Initialize scores with infinity
+            for (let i = 0; i < gridSize; i++) {
+                for (let j = 0; j < gridSize; j++) {
+                    gScore[`${i},${j}`] = Infinity;
+                    fScore[`${i},${j}`] = Infinity;
+                }
+            }
+            
+            // Set start node scores
+            const startKey = `${startI},${startJ}`;
+            gScore[startKey] = 0;
+            fScore[startKey] = heuristic(startI, startJ, targetI, targetJ);
+            
+            // Add start to open set with priority based on fScore
+            openSet.push({
+                i: startI,
+                j: startJ,
+                f: fScore[startKey]
+            });
+            
+            // Safety distance parameters
+            const safetyRadius = 2; // How many cells to check around the current position
+            const maxSafetyPenalty = 5.0; // Maximum penalty for cells right next to obstacles
+            
+            while (openSet.length > 0) {
+                // Sort by fScore and get node with lowest value
+                openSet.sort((a, b) => a.f - b.f);
+                const current = openSet.shift();
+                const currentKey = `${current.i},${current.j}`;
+                
+                // If we reached the target
+                if (current.i === targetI && current.j === targetJ) {
+                    // Reconstruct path
+                    return reconstructPath(cameFrom, current.i, current.j, startI, startJ);
+                }
+                
+                // Add to closed set
+                closedSet.add(currentKey);
+                
+                // Check all neighbors (8-connected grid for diagonal movement)
+                const neighbors = [
+                    // Orthogonal neighbors
+                    {i: current.i-1, j: current.j, cost: 1},    // Left
+                    {i: current.i+1, j: current.j, cost: 1},    // Right
+                    {i: current.i, j: current.j-1, cost: 1},    // Up
+                    {i: current.i, j: current.j+1, cost: 1},    // Down
+                    
+                    // Diagonal neighbors
+                    {i: current.i-1, j: current.j-1, cost: 1.414},  // Top-left
+                    {i: current.i+1, j: current.j-1, cost: 1.414},  // Top-right
+                    {i: current.i-1, j: current.j+1, cost: 1.414},  // Bottom-left
+                    {i: current.i+1, j: current.j+1, cost: 1.414}   // Bottom-right
+                ];
+                
+                for (const neighbor of neighbors) {
+                    // Skip if out of bounds
+                    if (neighbor.i < 0 || neighbor.i >= gridSize || 
+                        neighbor.j < 0 || neighbor.j >= gridSize) {
+                        continue;
+                    }
+                    
+                    const neighborKey = `${neighbor.i},${neighbor.j}`;
+                    
+                    // Skip if in closed set or is an obstacle
+                    if (closedSet.has(neighborKey) || grid[neighbor.i][neighbor.j].obstacle) {
+                        continue;
+                    }
+                    
+                    // For diagonal moves, check that the corners are valid (not blocked)
+                    if (neighbor.cost > 1) {
+                        // This is a diagonal move, check that the corners are not obstacles
+                        const di = neighbor.i - current.i;
+                        const dj = neighbor.j - current.j;
+                        
+                        // If either adjacent cell is an obstacle, don't allow cutting the corner
+                        if ((grid[current.i + di][current.j].obstacle) || 
+                            (grid[current.i][current.j + dj].obstacle)) {
+                            continue;
+                        }
+                    }
+                    
+                    // Only consider visited cells (we know they're free) unless it's the target
+                    if (!grid[neighbor.i][neighbor.j].visited && 
+                        !(neighbor.i === targetI && neighbor.j === targetJ)) {
+                        continue;
+                    }
+                    
+                    // Calculate safety penalty for this neighbor based on nearby obstacles
+                    let safetyPenalty = 0;
+                    
+                    // Check cells within safety radius for obstacles
+                    for (let di = -safetyRadius; di <= safetyRadius; di++) {
+                        for (let dj = -safetyRadius; dj <= safetyRadius; dj++) {
+                            const checkI = neighbor.i + di;
+                            const checkJ = neighbor.j + dj;
+                            
+                            // Skip if out of bounds or too distant
+                            if (checkI < 0 || checkI >= gridSize || checkJ < 0 || checkJ >= gridSize) {
+                                continue;
+                            }
+                            
+                            // If we find an obstacle, add penalty based on distance
+                            if (grid[checkI][checkJ].obstacle) {
+                                // Calculate distance to obstacle (using Euclidean distance)
+                                const distance = Math.sqrt(di*di + dj*dj);
+                                
+                                // Penalty decreases with distance
+                                if (distance <= safetyRadius) {
+                                    // Calculate penalty: highest at distance=1, decreases with distance
+                                    const distancePenalty = maxSafetyPenalty * (1 - (distance - 1) / safetyRadius);
+                                    safetyPenalty = Math.max(safetyPenalty, distancePenalty);
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Calculate tentative gScore (using proper diagonal cost + safety penalty)
+                    const tentativeGScore = gScore[currentKey] + neighbor.cost + safetyPenalty;
+                    
+                    // See if this path is better
+                    if (tentativeGScore < gScore[neighborKey]) {
+                        // This is a better path, record it
+                        cameFrom[neighborKey] = {i: current.i, j: current.j};
+                        gScore[neighborKey] = tentativeGScore;
+                        fScore[neighborKey] = gScore[neighborKey] + 
+                                             heuristic(neighbor.i, neighbor.j, targetI, targetJ);
+                        
+                        // Add to open set if not already there
+                        if (!openSet.some(node => node.i === neighbor.i && node.j === neighbor.j)) {
+                            openSet.push({
+                                i: neighbor.i,
+                                j: neighbor.j,
+                                f: fScore[neighborKey]
+                            });
+                        }
+                    }
+                }
+            }
+            
+            // No path found
+            console.log("No path found to target");
+            return null;
+        }
+        
+        // Heuristic function (Euclidean distance for diagonal movement)
+        function heuristic(i1, j1, i2, j2) {
+            // Use Euclidean distance for better diagonal path estimation
+            return Math.sqrt((i1 - i2) * (i1 - i2) + (j1 - j2) * (j1 - j2));
+        }
+        
+        // Optimize reconstructPath to create smoother paths 
+        function reconstructPath(cameFrom, targetI, targetJ, startI, startJ) {
+            const rawPath = [];
+            let current = {i: targetI, j: targetJ};
+            
+            // Follow cameFrom pointers back to start
+            while (!(current.i === startI && current.j === startJ)) {
+                rawPath.push({
+                    x: grid[current.i][current.j].x,
+                    z: grid[current.i][current.j].z,
+                    i: current.i,
+                    j: current.j
+                });
+                
+                const key = `${current.i},${current.j}`;
+                if (!cameFrom[key]) break; // Safety check
+                current = cameFrom[key];
+            }
+            
+            // Add the start point
+            rawPath.push({
+                x: grid[startI][startJ].x,
+                z: grid[startI][startJ].z,
+                i: startI,
+                j: startJ
+            });
+            
+            // Reverse path to get start-to-target order
+            rawPath.reverse();
+            
+            // Path smoothing - apply line-of-sight optimization
+            return smoothPath(rawPath);
+        }
+        
+        // Path smoothing function to create more direct paths with fewer initial turns
+        function smoothPath(path) {
+            if (path.length <= 2) return path;
+            
+            // Define minimum distance for considering a turning point
+            const minTurnDistance = 2.0 * cellSize; // Ignore turns closer than this to start
+            
+            const smoothedPath = [path[0]]; // Start with the first point
+            let currentPoint = 0;
+            
+            // Special handling for the beginning of the path
+            // Try to find the furthest visible point from the start that creates a good initial direction
+            let furthestInitialPoint = 1;
+            for (let i = path.length - 1; i > 0; i--) {
+                if (hasLineOfSight(path[0], path[i])) {
+                    // Calculate distance from start
+                    const distance = Math.sqrt(
+                        Math.pow(path[i].x - path[0].x, 2) + 
+                        Math.pow(path[i].z - path[0].z, 2)
+                    );
+                    
+                    // If far enough, use this as our first waypoint
+                    if (distance >= minTurnDistance) {
+                        furthestInitialPoint = i;
+                        break;
+                    }
+                }
+            }
+            
+            // If we found a good initial point, use it and mark path as visited
+            if (furthestInitialPoint > 1) {
+                markPathAsVisited(path[0], path[furthestInitialPoint]);
+                smoothedPath.push(path[furthestInitialPoint]);
+                currentPoint = furthestInitialPoint;
+            }
+            
+            // Continue with the rest of the path smoothing
+            while (currentPoint < path.length - 1) {
+                let furthestVisible = currentPoint + 1;
+                
+                // Try to find the furthest point with line-of-sight
+                for (let i = path.length - 1; i > currentPoint; i--) {
+                    if (hasLineOfSight(path[currentPoint], path[i])) {
+                        furthestVisible = i;
+                        break;
+                    }
+                }
+                
+                // Add this point to our smoothed path
+                if (furthestVisible !== currentPoint + 1) {
+                    // Mark all cells along this smoothed path as visited
+                    markPathAsVisited(path[currentPoint], path[furthestVisible]);
+                }
+                
+                smoothedPath.push(path[furthestVisible]);
+                currentPoint = furthestVisible;
+            }
+            
+            // Extra smoothing pass to eliminate unnecessary intermediate points
+            return eliminateRedundantPoints(smoothedPath);
+        }
+        
+        // Eliminate redundant intermediate waypoints where three points form a nearly straight line
+        function eliminateRedundantPoints(path) {
+            if (path.length <= 2) return path;
+            
+            const result = [path[0]];
+            
+            for (let i = 1; i < path.length - 1; i++) {
+                const prev = path[i-1];
+                const current = path[i];
+                const next = path[i+1];
+                
+                // Calculate vectors between consecutive points
+                const v1 = {
+                    x: current.x - prev.x,
+                    z: current.z - prev.z
+                };
+                const v2 = {
+                    x: next.x - current.x,
+                    z: next.z - current.z
+                };
+                
+                // Normalize vectors
+                const len1 = Math.sqrt(v1.x * v1.x + v1.z * v1.z);
+                const len2 = Math.sqrt(v2.x * v2.x + v2.z * v2.z);
+                
+                if (len1 > 0 && len2 > 0) {
+                    v1.x /= len1;
+                    v1.z /= len1;
+                    v2.x /= len2;
+                    v2.z /= len2;
+                    
+                    // Calculate dot product (cosine of angle between vectors)
+                    const dotProduct = v1.x * v2.x + v1.z * v2.z;
+                    
+                    // If points are nearly collinear (angle close to 0 or 180 degrees)
+                    // dot product will be close to 1 or -1
+                    if (Math.abs(dotProduct) > 0.97) { // Threshold for "nearly straight"
+                        // Skip this point (don't add to result)
+                        continue;
+                    }
+                }
+                
+                // Point isn't redundant, add it
+                result.push(current);
+            }
+            
+            // Always add the last point
+            result.push(path[path.length - 1]);
+            
+            return result;
+        }
+        
+        // Check if there's a direct line of sight between two points
+        function hasLineOfSight(pointA, pointB) {
+            // Bresenham's line algorithm to check all cells between points
+            const cells = getCellsOnLine(pointA.i, pointA.j, pointB.i, pointB.j);
+            
+            for (const cell of cells) {
+                // Skip the endpoints
+                if ((cell.i === pointA.i && cell.j === pointA.j) || 
+                    (cell.i === pointB.i && cell.j === pointB.j)) {
+                    continue;
+                }
+                
+                // Check if the cell is in bounds and not an obstacle
+                if (cell.i >= 0 && cell.i < gridSize && cell.j >= 0 && cell.j < gridSize) {
+                    if (grid[cell.i][cell.j].obstacle) {
+                        return false;
+                    }
+                    
+                    // If the cell hasn't been visited, we don't know if it's safe
+                    if (!grid[cell.i][cell.j].visited) {
+                        return false;
+                    }
+                } else {
+                    return false; // Out of bounds
+                }
+            }
+            
+            return true;
+        }
+        
+        // Mark all cells along a direct path as visited
+        function markPathAsVisited(pointA, pointB) {
+            const cells = getCellsOnLine(pointA.i, pointA.j, pointB.i, pointB.j);
+            
+            for (const cell of cells) {
+                if (cell.i >= 0 && cell.i < gridSize && cell.j >= 0 && cell.j < gridSize) {
+                    grid[cell.i][cell.j].visited = true;
+                }
+            }
+        }
+        
+        // Bresenham's line algorithm to get all cells on a line
+        function getCellsOnLine(x0, y0, x1, y1) {
+            const cells = [];
+            
+            const dx = Math.abs(x1 - x0);
+            const dy = Math.abs(y1 - y0);
+            const sx = (x0 < x1) ? 1 : -1;
+            const sy = (y0 < y1) ? 1 : -1;
+            let err = dx - dy;
+            
+            let x = x0;
+            let y = y0;
+            
+            while (true) {
+                cells.push({i: x, j: y});
+                
+                if (x === x1 && y === y1) break;
+                
+                const e2 = 2 * err;
+                if (e2 > -dy) {
+                    err -= dy;
+                    x += sx;
+                }
+                if (e2 < dx) {
+                    err += dx;
+                    y += sy;
+                }
+            }
+            
+            return cells;
+        }
+        
+        // Visualize path with thicker line and better color
+        function visualizePath(path) {
+            // Remove previous path visualization
+            if (pathVisualization) {
+                scene.remove(pathVisualization);
+            }
+            
+            if (!path || path.length < 2) return;
+            
+            // Create points for the path
+            const points = path.map(p => new THREE.Vector3(p.x, 0.1, p.z));
+            
+            // Create geometry
+            const geometry = new THREE.BufferGeometry().setFromPoints(points);
+            
+            // Create material with better visibility
+            const material = new THREE.LineBasicMaterial({ 
+                color: 0xFFCC00, // Bright yellow
+                linewidth: 3     // Note: linewidth only works in Firefox and only up to a certain width
+            });
+            
+            // Create line and add to scene
+            pathVisualization = new THREE.Line(geometry, material);
+            scene.add(pathVisualization);
+            
+            // Optionally add little spheres at waypoints for better visibility
+            const waypointGroup = new THREE.Group();
+            const waypointGeometry = new THREE.SphereGeometry(0.15, 8, 8);
+            const waypointMaterial = new THREE.MeshBasicMaterial({ color: 0xFFCC00 });
+            
+            path.forEach(p => {
+                const waypoint = new THREE.Mesh(waypointGeometry, waypointMaterial);
+                waypoint.position.set(p.x, 0.15, p.z);
+                waypointGroup.add(waypoint);
+            });
+            
+            // Add the first and last waypoints as larger spheres
+            if (path.length >= 2) {
+                // Start point (green)
+                const startGeometry = new THREE.SphereGeometry(0.25, 12, 12);
+                const startMaterial = new THREE.MeshBasicMaterial({ color: 0x00FF00 });
+                const startPoint = new THREE.Mesh(startGeometry, startMaterial);
+                startPoint.position.set(path[0].x, 0.2, path[0].z);
+                waypointGroup.add(startPoint);
+                
+                // End point (red)
+                const endGeometry = new THREE.SphereGeometry(0.25, 12, 12);
+                const endMaterial = new THREE.MeshBasicMaterial({ color: 0xFF0000 });
+                const endPoint = new THREE.Mesh(endGeometry, endMaterial);
+                endPoint.position.set(path[path.length-1].x, 0.2, path[path.length-1].z);
+                waypointGroup.add(endPoint);
+            }
+            
+            pathVisualization.add(waypointGroup);
+        }
+        
+
+
+        
+        // Update navigateToTarget with better handling of path following
+        function navigateToTarget() {
+            // If we have a path, follow it point by point
+            if (robot.userData.targetPath && robot.userData.targetPath.length > 0) {
+                // Get current target point on path
+                const pathIndex = robot.userData.pathIndex;
+                
+                if (pathIndex >= robot.userData.targetPath.length) {
+                    // Reached end of path, go back to exploring
+                    console.log("Reached end of path");
+                    robot.userData.moveMode = 'exploring';
+                    
+                    // Clean up path data
+                    robot.userData.targetPath = null;
+                    robot.userData.pathIndex = 0;
+                    
+                    // Remove path visualization
+                    if (pathVisualization) {
+                        scene.remove(pathVisualization);
+                        pathVisualization = null;
+                    }
+                    
+                    // Immediately start exploring
+                    moveRobotExploring();
+                    return;
+                }
+                
+                const currentTarget = robot.userData.targetPath[pathIndex];
+                const targetPos = new THREE.Vector3(
+                    currentTarget.x,
+                    robot.position.y,
+                    currentTarget.z
+                );
+                
+                // Mark cells along path as visited
+                const i = Math.floor((currentTarget.x + gridSize * cellSize / 2) / cellSize);
+                const j = Math.floor((currentTarget.z + gridSize * cellSize / 2) / cellSize);
+                if (i >= 0 && i < gridSize && j >= 0 && j < gridSize) {
+                    grid[i][j].visited = true;
+                }
+                
+                // Check if we've reached the current path point
+                if (robot.position.distanceTo(targetPos) < cellSize * 0.6) {
+                    // Move to next point
+                    robot.userData.pathIndex++;
+                    // Continue navigation immediately to the next point
+                    navigateToTarget();
+                    return;
+                }
+                
+                // Calculate direction to target
+                const directionToTarget = new THREE.Vector3()
+                    .subVectors(targetPos, robot.position) // Subtract the robot's position from the target position
+                    .normalize();
+                
+                // Calculate target angle (atan2 gives angle in range -π to π)
+                const targetAngle = Math.atan2(directionToTarget.x, directionToTarget.z);
+                robot.userData.targetDirection = targetAngle;
+                
+                // Calculate angle difference using the same normalization as in rotateRobot
+                let angleDiff = robot.userData.targetDirection - robot.userData.direction;
+                while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+                while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+                
+                // If not facing the right direction, rotate first
+                if (Math.abs(angleDiff) > robot.userData.rotationSpeed) {
+                    robot.userData.moveMode = 'rotating';
+                    // Don't move, just rotate
+                    rotateRobot();
+                } else {
+                    // Check if target grid cell has become an obstacle
+                    if (robot.userData.targetPath && robot.userData.targetPath.length > 0) {
+                        const currentTarget = robot.userData.targetPath[robot.userData.pathIndex];
+                        const targetI = Math.floor((currentTarget.x + gridSize * cellSize / 2) / cellSize);
+                        const targetJ = Math.floor((currentTarget.z + gridSize * cellSize / 2) / cellSize);
+                        
+                        // Check if the target grid is now an obstacle
+                        if (targetI >= 0 && targetI < gridSize && targetJ >= 0 && targetJ < gridSize && 
+                            grid[targetI][targetJ].obstacle) {
+                            console.log("Target grid has become an obstacle - switching to explore mode");
+                            
+                            // Switch to explore mode
+                            robot.userData.moveMode = 'exploring';
+                            
+                            // Clean up path data
+                            robot.userData.targetPath = null;
+                            robot.userData.pathIndex = 0;
+                            
+                            // Remove path visualization
+                            if (pathVisualization) {
+                                scene.remove(pathVisualization);
+                                pathVisualization = null;
+                            }
+                            
+                            // Immediately start exploring
+                            moveRobotExploring();
+                            return;
+                        }
+                    }
+                    
+                    // We're facing the right direction, move towards target
+                    robot.position.x += directionToTarget.x * robot.userData.speed;
+                    robot.position.z += directionToTarget.z * robot.userData.speed;
+                }
+            } else {
+                // No path available, go back to exploring
+                console.log("No path to follow, resuming exploration");
+                robot.userData.moveMode = 'exploring';
+                // Immediately execute exploration
+                moveRobotExploring();
+            }
+        }
+        
+        // Normalize angle to range -π to π
+        function normalizeAngle(angle) {
+            while (angle > Math.PI) angle -= 2 * Math.PI;
+            while (angle < -Math.PI) angle += 2 * Math.PI;
+            return angle;
+        }
+        
+        
+        // Update displayed information
+        function updateInfo() {
+            // Update position display
+            document.getElementById('position').textContent = 
+                `X: ${robot.position.x.toFixed(2)}, Z: ${robot.position.z.toFixed(2)}`;
+            
+            // Calculate and update coverage
+            const coverage = calculateCoverage();
+            document.getElementById('coverage').textContent = coverage.toFixed(2) + '%';
+            
+            // Update landmarks count
+            // document.getElementById('landmarks').textContent = countDiscoveredLandmarks();
+        }
+        
+        // Render function
+        function render() {
+            if (currentViewMode === "3d") {
+                // Regular 3D view
+                renderer.setViewport(0, 0, window.innerWidth, window.innerHeight);
+                renderer.render(scene, camera);
+            } else if (currentViewMode === "topDown") {
+                // Top-down map view
+                renderer.setViewport(0, 0, window.innerWidth, window.innerHeight);
+                renderer.render(scene, camera2D);
+            } else if (currentViewMode === "thirdPerson") {
+                // Third person view
+                renderer.setViewport(0, 0, window.innerWidth, window.innerHeight);
+                renderer.render(scene, camera);
+            } else if (currentViewMode === "pointCloud") {
+                // Point cloud view (can implement later)
+                renderer.setViewport(0, 0, window.innerWidth, window.innerHeight);
+                renderer.render(scene, camera);
+            }
+        }
+        
+        // Animation loop
+        
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            // Update controls
+            
+            
+            // Update robot
+            updateRobot();
+            
+            // Handle completion marker animation
+            if (completionMessage) {
+                animateCompletionMarker();
+            }
+            
+            // Update camera based on view mode
+            if (currentViewMode === "3d" && cameraFollowRobot) {
+                update3DCameraPosition();
+            } else if (currentViewMode === "thirdPerson") {
+                updateThirdPersonCamera();
+            }
+            else if (currentViewMode === "topDown") {
+                updateTopDownCamera();
+                
+            }
+            
+            render();
+        }
+        
+        // Add this function to check for mapping completion
+        function checkMappingCompletion() {
+            // If already marked as complete, no need to check again
+            if (mappingComplete) return;
+            
+            // Calculate coverage
+            const coverage = calculateCoverage();
+            
+            // Check if mapping is complete (100% coverage)
+            if (coverage >=100) { // Using 99% to account for any rounding issues
+                console.log("Mapping complete!");
+                mappingComplete = true;
+                
+                // Stop the robot
+                // isRunning = false;
+                
+                // Update button text
+                document.getElementById('startStop').textContent = "Mapping Complete!";
+                
+                // Show completion message
+                showCompletionMessage();
+            }
+        }
+        
+        // Function to show completion message
+        function showCompletionMessage() {
+            // Instead of using 3D text which requires font loading, use HTML overlay
+            const overlay = document.createElement('div');
+            overlay.id = 'completion-overlay';
+            overlay.innerHTML = '<div style="position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); background-color:rgba(0,0,0,0.8); color:#FFD700; padding:20px; border-radius:10px; font-size:24px; z-index:1000; font-weight:bold;">Mapping Complete!</div>';
+            document.body.appendChild(overlay);
+            
+            // Also show a simple marker above the robot in 3D space
+            const markerGeometry = new THREE.SphereGeometry(0.5, 16, 16);
+            const markerMaterial = new THREE.MeshBasicMaterial({ 
+                color: 0xFFD700,
+                transparent: true,
+                opacity: 0.8
+            });
+            
+            completionMessage = new THREE.Mesh(markerGeometry, markerMaterial);
+            
+            // Position marker above the robot
+            completionMessage.position.set(
+                robot.position.x,
+                robot.position.y + 3,
+                robot.position.z
+            );
+            
+            // Add pulsing animation
+            completionMessage.userData.pulseDirection = 1;
+            completionMessage.userData.pulseSpeed = 0.01;
+            completionMessage.userData.minScale = 0.8;
+            completionMessage.userData.maxScale = 1.2;
+            completionMessage.userData.createdTime = Date.now();
+            completionMessage.userData.duration = 3000; // 3 seconds duration
+            
+            // Add to scene
+            scene.add(completionMessage);
+            
+            // Make sure the animate function handles the removal
+            // This is non-blocking and allows animation to continue
+            setTimeout(() => {
+                // Remove HTML overlay
+                if (overlay && overlay.parentNode) {
+                    overlay.parentNode.removeChild(overlay);
+                }
+            }, 3000); // 3000 milliseconds = 3 seconds
+        }
+        
+        // Add this function to animate and remove the completion marker
+        function animateCompletionMarker() {
+            if (!completionMessage) return;
+            
+            // Calculate elapsed time
+            const elapsed = Date.now() - completionMessage.userData.createdTime;
+            
+            // Check if we should remove the marker
+            if (elapsed >= completionMessage.userData.duration) {
+                scene.remove(completionMessage);
+                completionMessage = null;
+                return;
+            }
+            
+            // Update pulse animation
+            const scale = completionMessage.scale.x;
+            
+            if (completionMessage.userData.pulseDirection > 0) {
+                // Growing
+                if (scale < completionMessage.userData.maxScale) {
+                    const newScale = scale + completionMessage.userData.pulseSpeed;
+                    completionMessage.scale.set(newScale, newScale, newScale);
+                } else {
+                    completionMessage.userData.pulseDirection = -1;
+                }
+            } else {
+                // Shrinking
+                if (scale > completionMessage.userData.minScale) {
+                    const newScale = scale - completionMessage.userData.pulseSpeed;
+                    completionMessage.scale.set(newScale, newScale, newScale);
+                } else {
+                    completionMessage.userData.pulseDirection = 1;
+                }
+            }
+            
+            // Keep the marker above the robot
+            completionMessage.position.set(
+                robot.position.x,
+                robot.position.y + 3,
+                robot.position.z
+            );
+        }
+
+        let camera2DFollowRobot = false;
+
+
+        // Add keyboard controls
+        function setupKeyboardControls() {
+            window.addEventListener('keydown', (event) => {
+                keysPressed[event.key] = true;
+                
+                // Toggle camera follow mode with spacebar in top-down view
+                if (event.key === ' ' && currentViewMode === "topDown") {
+                    camera2DFollowRobot = !camera2DFollowRobot;
+                    
+                    
+                }
+            });
+            
+            window.addEventListener('keyup', (event) => {
+                keysPressed[event.key] = false;
+            });
+        }
+
+        // Handle camera movement in top-down view
+        function updateTopDownCameraControls() {
+            if (camera2DFollowRobot) {
+            camera2DPosition.x = robot.position.x;
+            camera2DPosition.z = robot.position.z;
+            } 
+            // Otherwise, allow manual camera movement with keys
+            else {
+                let moveX = 0;
+                let moveZ = 0;
+                
+                // WASD controls
+                if (keysPressed['w'] || keysPressed['W'] || keysPressed['ArrowUp']) {
+                    moveZ -= camera2DMoveSpeed;
+                }
+                if (keysPressed['s'] || keysPressed['S'] || keysPressed['ArrowDown']) {
+                    moveZ += camera2DMoveSpeed;
+                }
+                if (keysPressed['a'] || keysPressed['A'] || keysPressed['ArrowLeft']) {
+                    moveX -= camera2DMoveSpeed;
+                }
+                if (keysPressed['d'] || keysPressed['D'] || keysPressed['ArrowRight']) {
+                    moveX += camera2DMoveSpeed;
+                }
+                
+                // Update camera position with limits
+                camera2DPosition.x = Math.max(-camera2DMoveLimit, Math.min(camera2DMoveLimit, camera2DPosition.x + moveX));
+                camera2DPosition.z = Math.max(-camera2DMoveLimit, Math.min(camera2DMoveLimit, camera2DPosition.z + moveZ));
+            }
+            
+            // Update camera position
+            camera2D.position.x = camera2DPosition.x;
+            camera2D.position.z = camera2DPosition.z;
+            
+            
+        }
+
+        // Start the app
+        init();
+    </script>
+</body>
+</html>
